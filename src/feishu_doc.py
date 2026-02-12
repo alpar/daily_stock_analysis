@@ -2,10 +2,33 @@
 # -*- coding: utf-8 -*-
 import logging
 import json
+import sys
 import lark_oapi as lark
 from lark_oapi.api.docx.v1 import *
 from typing import List, Dict, Any, Optional
 from src.config import get_config
+
+try:
+    from markdown_it import MarkdownIt
+    from markdown_it.token import Token
+except Exception:
+    MarkdownIt = None
+    Token = None
+
+# friendly hint when optional parser is missing
+MD_PARSER_AVAILABLE = MarkdownIt is not None
+if not MD_PARSER_AVAILABLE:
+    msg = (
+        "Optional dependency 'markdown-it-py' not found. "
+        "Install it to enable richer Markdown parsing:\n"
+        "  pip install markdown-it-py"
+    )
+    logger = logging.getLogger(__name__)
+    logger.warning(msg)
+    try:
+        print(msg, file=sys.stderr)
+    except Exception:
+        pass
 
 logger = logging.getLogger(__name__)
 
@@ -102,40 +125,11 @@ class FeishuDocManager:
         """
         将简单的 Markdown 转换为飞书 SDK 的 Block 对象
         """
-        blocks = []
-        lines = md_text.split('\n')
+        blocks: List[Block] = []
 
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-
-            # 默认普通文本 (Text = 2)
-            block_type = 2
-            text_content = line
-
-            # 识别标题
-            if line.startswith('# '):
-                block_type = 3  # H1
-                text_content = line[2:]
-            elif line.startswith('## '):
-                block_type = 4  # H2
-                text_content = line[3:]
-            elif line.startswith('### '):
-                block_type = 5  # H3
-                text_content = line[4:]
-            elif line.startswith('---'):
-                # 分割线
-                blocks.append(Block.builder()
-                              .block_type(22)
-                              .divider(Divider.builder().build())
-                              .build())
-                continue
-
-            # 构造 Text 类型的 Block
-            # SDK 的结构嵌套比较深: Block -> Text -> elements -> TextElement -> TextRun -> content
+        def build_text_obj(content: str) -> Text:
             text_run = TextRun.builder() \
-                .content(text_content) \
+                .content(content) \
                 .text_element_style(TextElementStyle.builder().build()) \
                 .build()
 
@@ -143,23 +137,179 @@ class FeishuDocManager:
                 .text_run(text_run) \
                 .build()
 
-            text_obj = Text.builder() \
+            return Text.builder() \
                 .elements([text_element]) \
                 .style(TextStyle.builder().build()) \
                 .build()
 
-            # 根据 block_type 放入正确的属性容器
-            block_builder = Block.builder().block_type(block_type)
+        def extract_inline_text(inline_token: Token) -> str:
+            if not getattr(inline_token, 'children', None):
+                return inline_token.content or ''
 
-            if block_type == 2:
-                block_builder.text(text_obj)
-            elif block_type == 3:
-                block_builder.heading1(text_obj)
-            elif block_type == 4:
-                block_builder.heading2(text_obj)
-            elif block_type == 5:
-                block_builder.heading3(text_obj)
+            parts: List[str] = []
+            for child in inline_token.children:
+                t = child.type
+                if t == 'text':
+                    parts.append(child.content)
+                elif t == 'code_inline':
+                    parts.append('`' + child.content + '`')
+                elif t == 'image':
+                    src = child.attrGet('src') or ''
+                    alt = child.attrGet('alt') or 'image'
+                    parts.append(f'[图片: {alt}]({src})')
+                elif t == 'link_open':
+                    # mark start of link
+                    parts.append('[')
+                elif t == 'link_close':
+                    parts.append(']')
+                elif t in ('strong_open', 'strong_close'):
+                    parts.append('**')
+                elif t in ('em_open', 'em_close'):
+                    parts.append('*')
+                else:
+                    if hasattr(child, 'content') and child.content:
+                        parts.append(child.content)
 
-            blocks.append(block_builder.build())
+            return ''.join(parts)
+
+        if MarkdownIt is None:
+            # fallback to original simple line parser
+            lines = md_text.split('\n')
+            for line in lines:
+                s = line.strip()
+                if not s:
+                    continue
+                if s.startswith('# '):
+                    text_obj = build_text_obj(s[2:])
+                    blocks.append(Block.builder().block_type(3).heading1(text_obj).build())
+                    continue
+                if s.startswith('## '):
+                    text_obj = build_text_obj(s[3:])
+                    blocks.append(Block.builder().block_type(4).heading2(text_obj).build())
+                    continue
+                if s.startswith('### '):
+                    text_obj = build_text_obj(s[4:])
+                    blocks.append(Block.builder().block_type(5).heading3(text_obj).build())
+                    continue
+                if s.startswith('---'):
+                    blocks.append(Block.builder().block_type(22).divider(Divider.builder().build()).build())
+                    continue
+                text_obj = build_text_obj(s)
+                blocks.append(Block.builder().block_type(2).text(text_obj).build())
+
+            return blocks
+
+        md = MarkdownIt().enable('table')
+        tokens = md.parse(md_text)
+
+        i = 0
+        while i < len(tokens):
+            token = tokens[i]
+            ttype = token.type
+
+            if ttype == 'heading_open':
+                level = int(token.tag[1]) if token.tag and len(token.tag) > 1 else 1
+                inline = tokens[i + 1]
+                content = extract_inline_text(inline)
+                text_obj = build_text_obj(content)
+                if level == 1:
+                    blocks.append(Block.builder().block_type(3).heading1(text_obj).build())
+                elif level == 2:
+                    blocks.append(Block.builder().block_type(4).heading2(text_obj).build())
+                else:
+                    blocks.append(Block.builder().block_type(5).heading3(text_obj).build())
+                i += 3
+                continue
+
+            if ttype == 'paragraph_open':
+                inline = tokens[i + 1]
+                content = extract_inline_text(inline)
+                text_obj = build_text_obj(content)
+                blocks.append(Block.builder().block_type(2).text(text_obj).build())
+                i += 3
+                continue
+
+            if ttype == 'fence':
+                code = token.content.rstrip('\n')
+                # 将代码块作为预格式化文本写入
+                text_obj = build_text_obj('```\n' + code + '\n```')
+                blocks.append(Block.builder().block_type(2).text(text_obj).build())
+                i += 1
+                continue
+
+            if ttype in ('bullet_list_open', 'ordered_list_open'):
+                ordered = (ttype == 'ordered_list_open')
+                j = i + 1
+                index_counter = 1
+                while j < len(tokens) and tokens[j].type not in ('bullet_list_close', 'ordered_list_close'):
+                    if tokens[j].type == 'list_item_open':
+                        inline_token = None
+                        for k in range(j, min(j + 6, len(tokens))):
+                            if tokens[k].type == 'inline':
+                                inline_token = tokens[k]
+                                break
+                        if inline_token:
+                            content = extract_inline_text(inline_token)
+                            prefix = f"{index_counter}. " if ordered else "- "
+                            text_obj = build_text_obj(prefix + content)
+                            blocks.append(Block.builder().block_type(2).text(text_obj).build())
+                        index_counter += 1
+                    j += 1
+                i = j + 1
+                continue
+
+            if ttype == 'blockquote_open':
+                j = i + 1
+                lines = []
+                while j < len(tokens) and tokens[j].type != 'blockquote_close':
+                    if tokens[j].type == 'paragraph_open':
+                        inline = tokens[j + 1]
+                        lines.append('> ' + extract_inline_text(inline))
+                        j += 3
+                        continue
+                    j += 1
+                text_obj = build_text_obj('\n'.join(lines))
+                blocks.append(Block.builder().block_type(2).text(text_obj).build())
+                i = j + 1
+                continue
+
+            if ttype == 'table_open':
+                j = i + 1
+                headers = []
+                rows: List[List[str]] = []
+                current_row: List[str] = []
+                while j < len(tokens) and tokens[j].type != 'table_close':
+                    if tokens[j].type == 'th_open':
+                        inline = tokens[j + 1]
+                        headers.append(extract_inline_text(inline))
+                        j += 3
+                        continue
+                    if tokens[j].type == 'td_open':
+                        inline = tokens[j + 1]
+                        current_row.append(extract_inline_text(inline))
+                        j += 3
+                        # if next is tr_close, push row
+                        if j < len(tokens) and tokens[j].type == 'tr_close':
+                            if current_row:
+                                rows.append(current_row)
+                            current_row = []
+                        continue
+                    j += 1
+
+                table_lines: List[str] = []
+                if headers:
+                    table_lines.append('| ' + ' | '.join(headers) + ' |')
+                    table_lines.append('|' + '---|' * len(headers))
+                for r in rows:
+                    table_lines.append('| ' + ' | '.join(r) + ' |')
+
+                if table_lines:
+                    text_obj = build_text_obj('\n'.join(table_lines))
+                    blocks.append(Block.builder().block_type(2).text(text_obj).build())
+
+                i = j + 1
+                continue
+
+            i += 1
 
         return blocks
